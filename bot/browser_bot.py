@@ -190,46 +190,53 @@ class BrowserBot:
     # スクロールループ
     # ------------------------------------------------------------------
 
+    def _press_page_down(self) -> None:
+        """body要素を毎回取得してPageDownを1回押す。"""
+        try:
+            self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
+        except WebDriverException:
+            pass
+
+    def _press_f5(self) -> None:
+        """body要素を毎回取得してF5を押し、ページ読み込みを待機する。"""
+        try:
+            self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.F5)
+            time.sleep(3)  # ページ読み込み待機
+        except WebDriverException:
+            pass
+
     def _scroll_loop(self) -> None:
         """
-        スクロール＆F5更新を停止フラグが立つまでループ実行する。
+        以下を停止ボタンが押されるまで無限に繰り返す。
+
+        ループ:
+          1. PageDownを scroll_interval 秒ごとに scroll_count 回押す
+          2. refresh_interval 秒待ってから F5 を押す
+          3. 1 に戻る
         """
         self._log("スクロール動作を開始します")
 
         while not self._is_stopped():
-            # body要素の取得（F5後のページ遷移で再取得が必要）
-            try:
-                body = self.driver.find_element(By.TAG_NAME, "body")
-            except WebDriverException:
-                self._log("⚠️ ページ要素の取得に失敗しました。リトライします...")
-                if not self._sleep(2):
-                    break
-                continue
 
-            # PageDownをscroll_count回実行
+            # Step 1: PageDownを scroll_interval 秒ごとに scroll_count 回押す
             for _ in range(self.scroll_count):
                 if self._is_stopped():
                     return
-                try:
-                    body.send_keys(Keys.PAGE_DOWN)
-                except WebDriverException:
-                    pass
+                self._press_page_down()
                 if not self._sleep(self.scroll_interval):
                     return
 
-            # F5更新までの待機
+            # Step 2: refresh_interval 秒待つ
             if not self._sleep(self.refresh_interval):
                 return
 
-            # F5更新
+            # Step 3: F5更新
             if self._is_stopped():
                 return
-            try:
-                self._log("🔄 F5更新")
-                body.send_keys(Keys.F5)
-                time.sleep(3)  # ページ読み込み待機
-            except WebDriverException:
-                pass
+            self._log("🔄 F5更新")
+            self._press_f5()
+
+            # → Step 1 に戻る
 
     # ------------------------------------------------------------------
     # 公開インターフェース

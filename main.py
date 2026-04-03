@@ -375,7 +375,7 @@ class AutoScrollBotApp(tk.Tk):
                 row=1, column=0, sticky=tk.W, padx=12, pady=6
             )
             ttk.Entry(frame, textvariable=self._account_vars[i][1],
-                      show="●", style="Custom.TEntry").grid(
+                      style="Custom.TEntry").grid(
                 row=1, column=1, sticky=tk.EW, padx=(0, 12), pady=6
             )
 
