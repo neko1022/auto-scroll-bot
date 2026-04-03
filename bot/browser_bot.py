@@ -128,23 +128,31 @@ class BrowserBot:
 
     def _is_logged_in(self) -> bool:
         """
-        現在のページがTwitterのホーム画面かどうかを判定する。
-        URLに /home が含まれるか、またはセッションCookieが存在するかで判定。
+        ログイン済みかをURLとDOMで厳密に判定する。
+
+        判定手順:
+        1. x.com/home に遷移する（未ログインならTwitterがログインページへリダイレクトする）
+        2. 遷移後のURLにログインページのパターンが含まれれば未ログインと判断
+        3. ログイン済みナビバーのDOM要素が存在すればログイン済みと判断
         """
         try:
+            self.driver.get("https://x.com/home")
+            # リダイレクト完了を待つ
+            time.sleep(4)
+
             url = self.driver.current_url
-            # ホーム・タイムライン・検索ページ等ならログイン済みとみなす
-            logged_in_patterns = ["/home", "/i/", "/search", "twitter.com/", "x.com/"]
-            login_page_patterns = ["twitter.com/login", "x.com/login",
-                                   "twitter.com/i/flow/login", "x.com/i/flow/login"]
-            if any(p in url for p in login_page_patterns):
+
+            # ログインページへリダイレクトされていれば未ログイン
+            login_patterns = ("login", "i/flow", "signin")
+            if any(p in url for p in login_patterns):
                 return False
-            if any(p in url for p in logged_in_patterns):
-                return True
-            # Cookieによる判定
-            cookies = self.driver.get_cookies()
-            auth_cookies = [c for c in cookies if c.get("name") in ("auth_token", "ct0")]
-            return len(auth_cookies) > 0
+
+            # ログイン済みナビバー（ホームリンク）のDOM存在確認
+            elements = self.driver.find_elements(
+                By.CSS_SELECTOR, '[data-testid="AppTabBar_Home_Link"]'
+            )
+            return len(elements) > 0
+
         except WebDriverException:
             return False
 
@@ -228,6 +236,23 @@ class BrowserBot:
             self._log(f"❌ ログイン中にエラーが発生しました: {e}")
             return False
 
+    def _is_on_home(self) -> bool:
+        """
+        現在のURLがホーム画面かナビバーDOMが存在するかを確認する。
+        手動認証待機中のポーリング用（x.com/home への再遷移は行わない）。
+        """
+        try:
+            url = self.driver.current_url
+            login_patterns = ("login", "i/flow", "signin")
+            if any(p in url for p in login_patterns):
+                return False
+            elements = self.driver.find_elements(
+                By.CSS_SELECTOR, '[data-testid="AppTabBar_Home_Link"]'
+            )
+            return len(elements) > 0
+        except WebDriverException:
+            return False
+
     def _wait_for_manual_auth(self) -> bool:
         """
         手動認証が完了するまでポーリングで待機する（最大5分）。
@@ -239,7 +264,7 @@ class BrowserBot:
         while time.time() < deadline:
             if self._is_stopped():
                 return False
-            if self._is_logged_in():
+            if self._is_on_home():
                 self._log("✅ 手動認証完了・ログイン確認")
                 return True
             time.sleep(5)
@@ -306,20 +331,19 @@ class BrowserBot:
             self._log("Chromeを起動しています...")
             self.driver = self._build_driver()
 
-            # ターゲットURLを開く
-            self.driver.get(self.target_url)
-            time.sleep(3)
-
-            # ログイン確認
+            # x.com/home への遷移でログイン状態を確認する
+            # （未ログイン時はTwitterがログインページへリダイレクトするため確実）
+            self._log("ログイン状態を確認しています...")
             if not self._is_logged_in():
                 success = self._login()
                 if not success:
                     return
-                # ログイン後に対象URLへ遷移
-                self.driver.get(self.target_url)
-                time.sleep(3)
             else:
                 self._log("✅ 既存セッションでログイン済み")
+
+            # 対象URLへ遷移
+            self.driver.get(self.target_url)
+            time.sleep(3)
 
             # スクロールループ
             self._scroll_loop()
