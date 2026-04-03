@@ -7,6 +7,7 @@ undetected-chromedriver でbot検知を回避する。
 import os
 import re
 import subprocess
+import sys
 import time
 import threading
 from typing import Callable
@@ -16,10 +17,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import WebDriverException
 
-# プロファイル保存先
-_BASE = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-)
+# exe実行時はexeと同じフォルダ、python実行時はプロジェクトルート
+if getattr(sys, "frozen", False):
+    _BASE = os.path.dirname(sys.executable)
+else:
+    _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 PROFILES_DIR = os.path.join(_BASE, "profiles")
 
 # 手動ログイン待機の最大秒数（5分）
