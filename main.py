@@ -466,21 +466,6 @@ class AutoScrollBotApp(tk.Tk):
             messagebox.showwarning("入力エラー", "URLはhttps://から始める必要があります。")
             return
 
-        count = self._var_instances.get()
-        accounts = self._accounts[:count]
-
-        # アカウント数が足りなければUI上の値を使う
-        if len(accounts) < count:
-            accounts = []
-            for i in range(count):
-                username = self._account_vars[i][0].get().strip()
-                password = self._account_vars[i][1].get()
-                accounts.append({"username": username, "password": password})
-
-        if not any(a["username"] for a in accounts):
-            messagebox.showwarning("入力エラー", "少なくとも1つのアカウントを設定してください。")
-            return
-
         self._btn_start.config(state=tk.DISABLED)
         self._btn_stop.config(state=tk.NORMAL)
 
@@ -488,7 +473,7 @@ class AutoScrollBotApp(tk.Tk):
         self._notebook.select(2)
 
         self._manager.start(
-            accounts=accounts,
+            instance_count=self._var_instances.get(),
             target_url=url,
             scroll_interval=self._var_interval.get(),
             scroll_count=self._var_count.get(),

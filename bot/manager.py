@@ -24,17 +24,18 @@ class BotManager:
 
     def start(
         self,
-        accounts: list[dict],
+        instance_count: int,
         target_url: str,
         scroll_interval: float,
         scroll_count: int,
         refresh_interval: float,
     ) -> None:
         """
-        指定されたアカウント数分のBrowserBotをスレッドで起動する。
+        指定インスタンス数分のBrowserBotをスレッドで起動する。
+        ログインは各ブラウザで手動で行う。
 
         Args:
-            accounts: [{"username": str, "password": str}, ...] のリスト
+            instance_count: 起動するインスタンス数（1〜5）
             target_url: スクロール対象URL
             scroll_interval: PageDown間隔（秒）
             scroll_count: PageDown回数
@@ -43,11 +44,9 @@ class BotManager:
         self._bots.clear()
         self._threads.clear()
 
-        for i, account in enumerate(accounts, start=1):
+        for i in range(1, instance_count + 1):
             bot = BrowserBot(
                 index=i,
-                username=account.get("username", ""),
-                password=account.get("password", ""),
                 target_url=target_url,
                 scroll_interval=scroll_interval,
                 scroll_count=scroll_count,
@@ -60,7 +59,7 @@ class BotManager:
             self._threads.append(thread)
             thread.start()
 
-        self.log_callback(f"▶ {len(accounts)}件のインスタンスを起動しました")
+        self.log_callback(f"▶ {instance_count}件のインスタンスを起動しました")
 
     def stop(self) -> None:
         """全BrowserBotに停止シグナルを送る。"""
