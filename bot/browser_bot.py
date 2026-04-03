@@ -13,7 +13,7 @@ from typing import Callable
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.keys import Keys  # PageDown用
 from selenium.common.exceptions import WebDriverException
 
 # プロファイル保存先
@@ -31,6 +31,10 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+
+
+# 複数スレッドが同時にChromeを初期化するとucが競合するため直列化する
+_driver_init_lock = threading.Lock()
 
 
 def _get_chrome_major_version() -> int | None:
@@ -123,6 +127,7 @@ class BrowserBot:
     def _build_driver(self) -> uc.Chrome:
         """
         undetected-chromedriver を使用してChromeを起動する。
+        複数インスタンスの同時初期化による競合を防ぐためロックで直列化する。
         専用プロファイル・User-Agent・bot検知回避オプションを設定する。
         """
         profile_dir = os.path.join(PROFILES_DIR, f"account{self.index}")
@@ -140,11 +145,13 @@ class BrowserBot:
         else:
             self._log("Chrome バージョンの自動検出に失敗しました。ucの自動検出を使用します。")
 
-        driver = uc.Chrome(
-            options=options,
-            user_data_dir=profile_dir,
-            version_main=chrome_version,
-        )
+        # ロックを取得してから初期化（同時起動による競合を防ぐ）
+        with _driver_init_lock:
+            driver = uc.Chrome(
+                options=options,
+                user_data_dir=profile_dir,
+                version_main=chrome_version,
+            )
         return driver
 
     # ------------------------------------------------------------------
@@ -198,10 +205,14 @@ class BrowserBot:
             pass
 
     def _press_f5(self) -> None:
-        """body要素を毎回取得してF5を押し、ページ読み込みを待機する。"""
+        """
+        driver.refresh() でページを更新し、トップにスクロールして読み込みを待機する。
+        Keys.F5 はフォーカス依存のため使用しない。
+        """
         try:
-            self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.F5)
+            self.driver.refresh()
             time.sleep(3)  # ページ読み込み待機
+            self.driver.execute_script("window.scrollTo(0, 0)")
         except WebDriverException:
             pass
 
