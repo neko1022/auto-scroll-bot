@@ -17,7 +17,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException,
-    NoSuchElementException,
     WebDriverException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
@@ -35,7 +34,7 @@ MANUAL_AUTH_TIMEOUT = 300  # 5分
 class BrowserBot:
     """
     1つのChromeウィンドウを制御するボット。
-    ログイン判定・自動ログイン・スクロールループを担う。
+    ログイン・スクロールループを担う。
     """
 
     def __init__(
@@ -97,6 +96,15 @@ class BrowserBot:
             time.sleep(0.3)
         return True
 
+    def _wait_for_element(self, by: str, value: str, timeout: int = 15):
+        """指定要素が現れるまで待機して返す。見つからなければNoneを返す。"""
+        try:
+            return WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located((by, value))
+            )
+        except TimeoutException:
+            return None
+
     # ------------------------------------------------------------------
     # Chrome起動
     # ------------------------------------------------------------------
@@ -123,135 +131,105 @@ class BrowserBot:
         return driver
 
     # ------------------------------------------------------------------
-    # ログイン判定・ログイン処理
+    # ログイン処理
     # ------------------------------------------------------------------
-
-    def _is_logged_in(self) -> bool:
-        """
-        ログイン済みかをURLとDOMで厳密に判定する。
-
-        判定手順:
-        1. x.com/home に遷移する（未ログインならTwitterがログインページへリダイレクトする）
-        2. 遷移後のURLにログインページのパターンが含まれれば未ログインと判断
-        3. ログイン済みナビバーのDOM要素が存在すればログイン済みと判断
-        """
-        try:
-            self.driver.get("https://x.com/home")
-            # リダイレクト完了を待つ
-            time.sleep(4)
-
-            url = self.driver.current_url
-
-            # ログインページへリダイレクトされていれば未ログイン
-            login_patterns = ("login", "i/flow", "signin")
-            if any(p in url for p in login_patterns):
-                return False
-
-            # ログイン済みナビバー（ホームリンク）のDOM存在確認
-            elements = self.driver.find_elements(
-                By.CSS_SELECTOR, '[data-testid="AppTabBar_Home_Link"]'
-            )
-            return len(elements) > 0
-
-        except WebDriverException:
-            return False
-
-    def _wait_for_element(self, by: str, value: str, timeout: int = 15):
-        """指定要素が現れるまで待機して返す。見つからなければNoneを返す。"""
-        try:
-            return WebDriverWait(self.driver, timeout).until(
-                EC.presence_of_element_located((by, value))
-            )
-        except TimeoutException:
-            return None
-
-    def _login(self) -> bool:
-        """
-        Twitterへ自動ログインを試みる。
-
-        Returns:
-            True: ログイン成功 / False: ログイン失敗
-        """
-        self._log("ログインページに遷移します...")
-        try:
-            self.driver.get("https://x.com/i/flow/login")
-            time.sleep(2)
-
-            # ユーザー名入力
-            username_input = self._wait_for_element(
-                By.CSS_SELECTOR, 'input[autocomplete="username"]', timeout=20
-            )
-            if not username_input:
-                self._log("❌ ユーザー名入力欄が見つかりませんでした")
-                return False
-            username_input.clear()
-            username_input.send_keys(self.username)
-            username_input.send_keys(Keys.RETURN)
-            time.sleep(2)
-
-            # 追加確認（電話番号・メールアドレス要求）
-            try:
-                extra_input = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, 'input[data-testid="ocfEnterTextTextInput"]')
-                    )
-                )
-                self._log("⚠️ 追加認証（電話番号/メール）を求められました。手動で入力してください。")
-                extra_input.send_keys(self.username)
-                extra_input.send_keys(Keys.RETURN)
-                time.sleep(2)
-            except TimeoutException:
-                pass  # 追加確認なし
-
-            # パスワード入力
-            password_input = self._wait_for_element(
-                By.CSS_SELECTOR, 'input[type="password"]', timeout=15
-            )
-            if not password_input:
-                self._log("❌ パスワード入力欄が見つかりませんでした")
-                return False
-            password_input.clear()
-            password_input.send_keys(self.password)
-            password_input.send_keys(Keys.RETURN)
-            time.sleep(3)
-
-            # 2段階認証・メール確認などの追加フロー検知
-            current_url = self.driver.current_url
-            is_challenge = any(
-                p in current_url
-                for p in ["challenge", "confirm", "verify", "2fa", "account/login"]
-            )
-            if is_challenge or not self._is_logged_in():
-                self._log("⚠️ 手動認証をお待ちしています...")
-                return self._wait_for_manual_auth()
-
-            if self._is_logged_in():
-                self._log("✅ ログイン完了")
-                return True
-            else:
-                self._log("❌ ログイン失敗")
-                return False
-
-        except WebDriverException as e:
-            self._log(f"❌ ログイン中にエラーが発生しました: {e}")
-            return False
 
     def _is_on_home(self) -> bool:
         """
-        現在のURLがホーム画面かナビバーDOMが存在するかを確認する。
-        手動認証待機中のポーリング用（x.com/home への再遷移は行わない）。
+        現在のページがログイン済みホーム画面かを確認する。
+        URLと認証済みナビバーDOMの両方で判定する。
         """
         try:
             url = self.driver.current_url
-            login_patterns = ("login", "i/flow", "signin")
-            if any(p in url for p in login_patterns):
+            # ログイン・認証フローのページにいる場合は未完了
+            if any(p in url for p in ("login", "i/flow", "signin")):
                 return False
+            # ログイン済みナビバー（ホームアイコン）の存在確認
             elements = self.driver.find_elements(
                 By.CSS_SELECTOR, '[data-testid="AppTabBar_Home_Link"]'
             )
             return len(elements) > 0
         except WebDriverException:
             return False
+
+    def _fill_login_form(self) -> bool:
+        """
+        ログインフォームにユーザー名・パスワードを入力して送信する。
+        呼び出し前にログインページが表示されている前提。
+
+        Returns:
+            True: フォーム送信完了 / False: 入力欄が見つからず失敗
+        """
+        # ユーザー名入力
+        username_input = self._wait_for_element(
+            By.CSS_SELECTOR, 'input[autocomplete="username"]', timeout=20
+        )
+        if not username_input:
+            self._log("❌ ユーザー名入力欄が見つかりませんでした")
+            return False
+        username_input.clear()
+        username_input.send_keys(self.username)
+        username_input.send_keys(Keys.RETURN)
+        time.sleep(2)
+
+        # 追加確認（電話番号・メールアドレス要求）が現れた場合
+        try:
+            extra_input = WebDriverWait(self.driver, 5).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, 'input[data-testid="ocfEnterTextTextInput"]')
+                )
+            )
+            self._log("⚠️ 追加認証入力欄を検知しました。ユーザー名で入力します...")
+            extra_input.send_keys(self.username)
+            extra_input.send_keys(Keys.RETURN)
+            time.sleep(2)
+        except TimeoutException:
+            pass  # 追加確認なし・正常ルート
+
+        # パスワード入力
+        password_input = self._wait_for_element(
+            By.CSS_SELECTOR, 'input[type="password"]', timeout=15
+        )
+        if not password_input:
+            self._log("❌ パスワード入力欄が見つかりませんでした")
+            return False
+        password_input.clear()
+        password_input.send_keys(self.password)
+        password_input.send_keys(Keys.RETURN)
+        time.sleep(3)
+
+        return True
+
+    def _confirm_login(self) -> bool:
+        """
+        パスワード送信後にログイン完了（x.com/home 到達）を待機する。
+        2段階認証・メール確認などのチャレンジを検知した場合は手動認証待機に移行する。
+
+        Returns:
+            True: ログイン完了 / False: 失敗またはタイムアウト
+        """
+        deadline = time.time() + 30  # 最大30秒待機
+        while time.time() < deadline:
+            if self._is_stopped():
+                return False
+
+            url = self.driver.current_url
+
+            # ホーム到達 → ログイン完了
+            if self._is_on_home():
+                self._log("✅ ログイン完了")
+                return True
+
+            # チャレンジページ検知 → 手動認証へ移行
+            challenge_patterns = ("challenge", "confirm", "verify", "2fa", "check_logged_in")
+            if any(p in url for p in challenge_patterns):
+                self._log("⚠️ 手動認証をお待ちしています...")
+                return self._wait_for_manual_auth()
+
+            time.sleep(1)
+
+        self._log("❌ ログイン確認タイムアウト")
+        return False
 
     def _wait_for_manual_auth(self) -> bool:
         """
@@ -280,10 +258,9 @@ class BrowserBot:
         スクロール＆F5更新を停止フラグが立つまでループ実行する。
         """
         self._log("スクロール動作を開始します")
-        body = None
 
         while not self._is_stopped():
-            # body要素の取得（ページ遷移後に再取得が必要な場合がある）
+            # body要素の取得（F5後のページ遷移で再取得が必要）
             try:
                 body = self.driver.find_element(By.TAG_NAME, "body")
             except WebDriverException:
@@ -293,7 +270,7 @@ class BrowserBot:
                 continue
 
             # PageDownをscroll_count回実行
-            for i in range(self.scroll_count):
+            for _ in range(self.scroll_count):
                 if self._is_stopped():
                     return
                 try:
@@ -323,29 +300,46 @@ class BrowserBot:
 
     def run(self) -> None:
         """
-        ボットのメイン処理。
-        Chrome起動 → ログイン → スクロールループ の順に実行する。
+        ボットのメイン処理。以下の順で実行する。
+
+        1. Chrome起動
+        2. https://x.com/login に遷移
+        3. 既存セッションがあれば /home へリダイレクトされる → スキップ
+        4. 未ログインの場合はフォーム入力して自動ログイン
+        5. ログイン完了（x.com/home）を確認
+        6. 対象URLへ遷移してスクロール動作を開始
         """
         self._stop_event.clear()
         try:
             self._log("Chromeを起動しています...")
             self.driver = self._build_driver()
 
-            # x.com/home への遷移でログイン状態を確認する
-            # （未ログイン時はTwitterがログインページへリダイレクトするため確実）
-            self._log("ログイン状態を確認しています...")
-            if not self._is_logged_in():
-                success = self._login()
-                if not success:
-                    return
-            else:
-                self._log("✅ 既存セッションでログイン済み")
+            # Step 1: ログインページへ遷移
+            self._log("https://x.com/login に遷移します...")
+            self.driver.get("https://x.com/login")
+            time.sleep(3)
 
-            # 対象URLへ遷移
+            # Step 2: 既存セッション確認
+            # セッションが残っていれば Twitter が /home へリダイレクトする
+            if self._is_on_home():
+                self._log("✅ 既存セッションでログイン済み")
+            else:
+                # Step 3: フォーム入力
+                ok = self._fill_login_form()
+                if not ok:
+                    return
+
+                # Step 4: ログイン完了を確認
+                ok = self._confirm_login()
+                if not ok:
+                    return
+
+            # Step 5: 対象URLへ遷移
+            self._log(f"対象URLへ遷移します: {self.target_url}")
             self.driver.get(self.target_url)
             time.sleep(3)
 
-            # スクロールループ
+            # Step 6: スクロールループ開始
             self._scroll_loop()
 
         except WebDriverException as e:
