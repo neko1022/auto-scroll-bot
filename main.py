@@ -1,18 +1,25 @@
 """
-自動スクロール＆更新ボット - エントリポイント・GUIアプリ。
-tkinterで3タブ構成のGUIを構築する。
+自動スクロール＆更新ボット — メインGUIアプリ。
+
+タブ構成:
+  - 設定1〜5（固定）＋ 設定6〜10（ボタンで追加）
+  - ログタブ（常に末尾）
+
+フッター:
+  - ▶ 開始: チェックボックスONのスロットのみ起動
+  - ■ 停止: 全インスタンス一括停止
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-import threading
 import queue
+import threading
+import tkinter as tk
 from datetime import datetime
+from tkinter import messagebox, ttk
 
-from utils.storage import load_settings, save_settings, load_accounts, save_accounts
 from bot.manager import BotManager
+from utils.storage import DEFAULT_SLOT, get_slot, load_settings, save_settings, save_slot
 
-# ---- カラー定義 ----------------------------------------------------------------
+# ---- カラー定義 ---------------------------------------------------------------
 C_PURPLE      = "#A020B8"
 C_PURPLE_DEEP = "#7B0FA0"
 C_PURPLE_DARK = "#6A0080"
@@ -22,423 +29,343 @@ C_TEXT_DARK   = "#2A0D38"
 C_TEXT_MID    = "#6B3A82"
 C_GOLD        = "#E6C77A"
 
-# インスタンスごとのログ色
-INSTANCE_COLORS = [
-    "#7B0FA0",  # 1: purple-deep
-    "#1565C0",  # 2: blue
-    "#2E7D32",  # 3: green
-    "#E65100",  # 4: orange
-    "#AD1457",  # 5: pink
-]
+# ログ色（スロット1〜10を5色でサイクル）
+LOG_COLORS = ["#7B0FA0", "#1565C0", "#2E7D32", "#C84B00", "#AD1457"]
 
+MAX_SLOTS    = 10
+INIT_SLOTS   = 5
+
+
+# ==============================================================================
+# SettingsTab — 1スロット分の設定フォーム
+# ==============================================================================
+
+class SettingsTab(ttk.Frame):
+    """
+    スロット1件分の設定タブ。
+    チェックボックス・URL・スクロール設定・メモ欄・保存ボタンを持つ。
+    """
+
+    def __init__(
+        self,
+        notebook: ttk.Notebook,
+        slot: int,
+        initial_data: dict,
+        on_save: callable,
+    ):
+        """
+        Args:
+            notebook: 親のNotebookウィジェット
+            slot: スロット番号（1〜10）
+            initial_data: 保存済み設定辞書
+            on_save: 保存ボタン押下時コールバック(slot, config)
+        """
+        super().__init__(notebook, style="Card.TFrame")
+        self.slot = slot
+        self._on_save = on_save
+
+        # --- 変数 ---
+        self.var_enabled  = tk.BooleanVar(value=initial_data.get("enabled", False))
+        self.var_url      = tk.StringVar(value=initial_data.get("url", "https://"))
+        self.var_interval = tk.DoubleVar(value=initial_data.get("scroll_interval", 3.0))
+        self.var_count    = tk.IntVar(value=initial_data.get("scroll_count", 10))
+        self.var_refresh  = tk.DoubleVar(value=initial_data.get("refresh_interval", 60.0))
+        self.var_username = tk.StringVar(value=initial_data.get("username", ""))
+        self.var_password = tk.StringVar(value=initial_data.get("password", ""))
+
+        self._build()
+
+        # チェックボックス変更時にタブラベルを更新
+        self.var_enabled.trace_add("write", lambda *_: self._update_tab_label())
+
+    # ------------------------------------------------------------------
+
+    def _build(self) -> None:
+        """フォームを構築する。"""
+        self.columnconfigure(1, weight=1)
+        pad = {"padx": (20, 12), "pady": 6}
+
+        # --- 有効チェックボックス ---
+        color = LOG_COLORS[(self.slot - 1) % len(LOG_COLORS)]
+        cb = tk.Checkbutton(
+            self,
+            text=f"  スロット {self.slot} を有効にする",
+            variable=self.var_enabled,
+            bg=C_CREAM, fg=color,
+            selectcolor=C_PURPLE_PALE,
+            activebackground=C_CREAM,
+            font=("Yu Gothic UI", 11, "bold"),
+            cursor="hand2",
+        )
+        cb.grid(row=0, column=0, columnspan=2, sticky=tk.W, padx=20, pady=(14, 8))
+
+        # --- 設定フィールド ---
+        fields = [
+            ("対象URL",              self.var_url,      "entry",   None, None, None),
+            ("PageDown 間隔（秒）",  self.var_interval, "spinbox", 0.5,  60,   0.5),
+            ("PageDown 回数",        self.var_count,    "spinbox", 1,    200,  1),
+            ("F5更新までの時間（秒）",self.var_refresh,  "spinbox", 5,    7200, 5),
+            ("ユーザー名（メモ）",   self.var_username, "entry",   None, None, None),
+            ("パスワード（メモ）",   self.var_password, "entry",   None, None, None),
+        ]
+
+        for row, (label, var, ftype, from_, to, inc) in enumerate(fields, start=1):
+            ttk.Label(self, text=label, style="Field.TLabel").grid(
+                row=row, column=0, sticky=tk.W, **pad
+            )
+            if ftype == "entry":
+                w = ttk.Entry(self, textvariable=var, style="Custom.TEntry")
+            else:
+                w = ttk.Spinbox(
+                    self, from_=from_, to=to, increment=inc,
+                    textvariable=var, style="Custom.TSpinbox", width=10,
+                )
+            w.grid(row=row, column=1, sticky=tk.EW, padx=(0, 20), pady=6)
+
+        # --- 保存ボタン ---
+        ttk.Button(
+            self, text="設定を保存", style="Save.TButton",
+            command=self._save,
+        ).grid(row=len(fields) + 1, column=0, columnspan=2, pady=(10, 14))
+
+    def _save(self) -> None:
+        """設定を保存してコールバックを呼ぶ。"""
+        self._on_save(self.slot, self.get_config())
+
+    def _update_tab_label(self) -> None:
+        """チェックボックスの状態をタブラベルに反映する。"""
+        try:
+            notebook = self.master
+            idx = notebook.index(self)
+            mark = " ✓" if self.var_enabled.get() else ""
+            notebook.tab(idx, text=f" 設定{self.slot}{mark} ")
+        except Exception:
+            pass
+
+    def get_config(self) -> dict:
+        """現在の入力値を辞書で返す。"""
+        return {
+            "enabled":         self.var_enabled.get(),
+            "url":             self.var_url.get().strip(),
+            "scroll_interval": self.var_interval.get(),
+            "scroll_count":    self.var_count.get(),
+            "refresh_interval":self.var_refresh.get(),
+            "username":        self.var_username.get(),
+            "password":        self.var_password.get(),
+        }
+
+
+# ==============================================================================
+# AutoScrollBotApp — メインアプリ
+# ==============================================================================
 
 class AutoScrollBotApp(tk.Tk):
-    """
-    自動スクロールボットのメインGUIアプリケーション。
-    3タブ（基本設定・アカウント設定・ログ）と共通フッターで構成される。
-    """
+    """自動スクロールボットのメインGUIウィンドウ。"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.title("AutoScrollBot")
-        self.geometry("640x560")
-        self.resizable(False, False)
+        self.geometry("680x590")
+        self.minsize(640, 560)
         self.configure(bg=C_CREAM)
 
-        # ログキュー（スレッドセーフな受け渡し）
-        self._log_queue: queue.Queue[tuple[str, int]] = queue.Queue()
+        self._settings_data   = load_settings()
+        self._slot_tabs: list[SettingsTab] = []
+        self._log_tab_frame: ttk.Frame | None = None
+        self._manager         = BotManager()
+        self._log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
 
-        # ボット管理
-        self._manager = BotManager(log_callback=self._enqueue_log)
-
-        # 設定・アカウント読み込み
-        self._settings = load_settings()
-        self._accounts = load_accounts()
-
-        # GUIの構築
         self._setup_styles()
         self._build_header()
-        self._build_tabs()
+        self._build_toolbar()
+        self._build_notebook()
         self._build_footer()
-
-        # タブ2のアカウントフォームを初期化
-        self._refresh_account_forms()
-
-        # ログのポーリング開始
         self._poll_log_queue()
 
     # ------------------------------------------------------------------
-    # スタイル設定
+    # スタイル
     # ------------------------------------------------------------------
 
     def _setup_styles(self) -> None:
         """ttk.Style でカスタムスタイルを定義する。"""
-        style = ttk.Style(self)
-        style.theme_use("clam")
+        s = ttk.Style(self)
+        s.theme_use("clam")
 
-        # ノートブック（タブ）
-        style.configure(
-            "Custom.TNotebook",
-            background=C_CREAM,
-            borderwidth=0,
-        )
-        style.configure(
-            "Custom.TNotebook.Tab",
-            background=C_PURPLE_PALE,
-            foreground=C_TEXT_DARK,
-            padding=(14, 6),
-            font=("Yu Gothic UI", 10, "bold"),
-            borderwidth=0,
-        )
-        style.map(
-            "Custom.TNotebook.Tab",
-            background=[("selected", C_PURPLE), ("active", C_PURPLE_DEEP)],
-            foreground=[("selected", "white"), ("active", "white")],
-        )
+        # Notebook
+        s.configure("Custom.TNotebook",
+                    background=C_CREAM, borderwidth=0)
+        s.configure("Custom.TNotebook.Tab",
+                    background=C_PURPLE_PALE, foreground=C_TEXT_DARK,
+                    padding=(10, 5), font=("Yu Gothic UI", 9, "bold"))
+        s.map("Custom.TNotebook.Tab",
+              background=[("selected", C_PURPLE), ("active", C_PURPLE_DEEP)],
+              foreground=[("selected", "white"), ("active", "white")])
 
-        # フレーム
-        style.configure("Card.TFrame", background=C_CREAM)
+        # Frame
+        s.configure("Card.TFrame", background=C_CREAM)
 
-        # ラベル
-        style.configure(
-            "Title.TLabel",
-            background=C_CREAM,
-            foreground=C_TEXT_DARK,
-            font=("Yu Gothic UI", 11, "bold"),
-        )
-        style.configure(
-            "Field.TLabel",
-            background=C_CREAM,
-            foreground=C_TEXT_MID,
-            font=("Yu Gothic UI", 10),
-        )
+        # Label
+        s.configure("Title.TLabel",
+                    background=C_CREAM, foreground=C_TEXT_DARK,
+                    font=("Yu Gothic UI", 11, "bold"))
+        s.configure("Field.TLabel",
+                    background=C_CREAM, foreground=C_TEXT_MID,
+                    font=("Yu Gothic UI", 10))
 
-        # エントリ
-        style.configure(
-            "Custom.TEntry",
-            fieldbackground="white",
-            foreground=C_TEXT_DARK,
-            bordercolor=C_PURPLE_PALE,
-            insertcolor=C_TEXT_DARK,
-        )
+        # Entry / Spinbox
+        s.configure("Custom.TEntry",
+                    fieldbackground="white", foreground=C_TEXT_DARK,
+                    bordercolor=C_PURPLE_PALE, insertcolor=C_TEXT_DARK)
+        s.configure("Custom.TSpinbox",
+                    fieldbackground="white", foreground=C_TEXT_DARK)
 
-        # スピンボックス
-        style.configure(
-            "Custom.TSpinbox",
-            fieldbackground="white",
-            foreground=C_TEXT_DARK,
-        )
+        # Buttons
+        s.configure("Start.TButton",
+                    background=C_PURPLE, foreground="white",
+                    font=("Yu Gothic UI", 11, "bold"),
+                    padding=(22, 8), borderwidth=0, relief="flat")
+        s.map("Start.TButton",
+              background=[("active", C_PURPLE_DEEP), ("disabled", "#C0A0CC")])
 
-        # ボタン
-        style.configure(
-            "Start.TButton",
-            background=C_PURPLE,
-            foreground="white",
-            font=("Yu Gothic UI", 11, "bold"),
-            padding=(20, 8),
-            borderwidth=0,
-            relief="flat",
-        )
-        style.map(
-            "Start.TButton",
-            background=[("active", C_PURPLE_DEEP)],
-        )
-        style.configure(
-            "Stop.TButton",
-            background=C_PURPLE_DARK,
-            foreground="white",
-            font=("Yu Gothic UI", 11, "bold"),
-            padding=(20, 8),
-            borderwidth=0,
-            relief="flat",
-        )
-        style.map(
-            "Stop.TButton",
-            background=[("active", "#4A005A")],
-        )
-        style.configure(
-            "Save.TButton",
-            background=C_GOLD,
-            foreground=C_TEXT_DARK,
-            font=("Yu Gothic UI", 10, "bold"),
-            padding=(16, 6),
-            borderwidth=0,
-            relief="flat",
-        )
-        style.map(
-            "Save.TButton",
-            background=[("active", "#D4A850")],
-        )
+        s.configure("Stop.TButton",
+                    background=C_PURPLE_DARK, foreground="white",
+                    font=("Yu Gothic UI", 11, "bold"),
+                    padding=(22, 8), borderwidth=0, relief="flat")
+        s.map("Stop.TButton",
+              background=[("active", "#4A005A"), ("disabled", "#A090A8")])
+
+        s.configure("Save.TButton",
+                    background=C_GOLD, foreground=C_TEXT_DARK,
+                    font=("Yu Gothic UI", 10, "bold"),
+                    padding=(18, 6), borderwidth=0, relief="flat")
+        s.map("Save.TButton", background=[("active", "#C9A84C")])
+
+        s.configure("Add.TButton",
+                    background=C_PURPLE_PALE, foreground=C_PURPLE_DARK,
+                    font=("Yu Gothic UI", 10, "bold"),
+                    padding=(12, 4), borderwidth=0, relief="flat")
+        s.map("Add.TButton",
+              background=[("active", C_PURPLE_PALE), ("disabled", "#E0D8E8")])
 
     # ------------------------------------------------------------------
     # ヘッダー
     # ------------------------------------------------------------------
 
     def _build_header(self) -> None:
-        """アプリ上部のタイトルバーを構築する。"""
-        header = tk.Frame(self, bg=C_PURPLE_DARK, height=48)
-        header.pack(fill=tk.X)
-        header.pack_propagate(False)
-
-        tk.Label(
-            header,
-            text="✦  AutoScrollBot  ✦",
-            bg=C_PURPLE_DARK,
-            fg=C_GOLD,
-            font=("Yu Gothic UI", 14, "bold"),
-        ).pack(expand=True)
+        """タイトルバーを構築する。"""
+        h = tk.Frame(self, bg=C_PURPLE_DARK, height=44)
+        h.pack(fill=tk.X)
+        h.pack_propagate(False)
+        tk.Label(h, text="✦  AutoScrollBot  ✦",
+                 bg=C_PURPLE_DARK, fg=C_GOLD,
+                 font=("Yu Gothic UI", 13, "bold")).pack(expand=True)
 
     # ------------------------------------------------------------------
-    # タブ構築
+    # ツールバー（タブ追加ボタン）
     # ------------------------------------------------------------------
 
-    def _build_tabs(self) -> None:
-        """3タブ（基本設定・アカウント設定・ログ）のノートブックを構築する。"""
+    def _build_toolbar(self) -> None:
+        """タブ追加ボタンを持つツールバーを構築する。"""
+        bar = tk.Frame(self, bg=C_CREAM, height=36)
+        bar.pack(fill=tk.X, padx=10, pady=(4, 0))
+        bar.pack_propagate(False)
+
+        self._btn_add_tab = ttk.Button(
+            bar, text=self._add_btn_label(),
+            style="Add.TButton",
+            command=self._on_add_tab,
+        )
+        self._btn_add_tab.pack(side=tk.LEFT, padx=2, pady=4)
+
+        if len(self._slot_tabs) >= MAX_SLOTS:
+            self._btn_add_tab.config(state=tk.DISABLED)
+
+    def _add_btn_label(self) -> str:
+        """タブ追加ボタンのラベルを生成する。"""
+        count = len(self._slot_tabs)
+        return f"  ＋ タブを追加  ({count}/{MAX_SLOTS})"
+
+    def _refresh_add_btn(self) -> None:
+        """タブ追加ボタンのラベルと有効状態を更新する。"""
+        count = len(self._slot_tabs)
+        self._btn_add_tab.config(text=self._add_btn_label())
+        state = tk.DISABLED if count >= MAX_SLOTS else tk.NORMAL
+        self._btn_add_tab.config(state=state)
+
+    # ------------------------------------------------------------------
+    # ノートブック
+    # ------------------------------------------------------------------
+
+    def _build_notebook(self) -> None:
+        """設定タブ（保存済み数）とログタブを構築する。"""
         self._notebook = ttk.Notebook(self, style="Custom.TNotebook")
-        self._notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 4))
+        self._notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(2, 4))
 
-        # タブ1
-        tab1 = ttk.Frame(self._notebook, style="Card.TFrame")
-        self._notebook.add(tab1, text="  基本設定  ")
-        self._build_tab_settings(tab1)
+        slot_count = max(INIT_SLOTS, self._settings_data.get("slot_count", INIT_SLOTS))
+        slot_count = min(slot_count, MAX_SLOTS)
 
-        # タブ2
-        tab2 = ttk.Frame(self._notebook, style="Card.TFrame")
-        self._notebook.add(tab2, text="  アカウント設定  ")
-        self._build_tab_accounts(tab2)
+        for i in range(1, slot_count + 1):
+            self._create_settings_tab(i)
 
-        # タブ3
-        tab3 = ttk.Frame(self._notebook, style="Card.TFrame")
-        self._notebook.add(tab3, text="  ログ  ")
-        self._build_tab_log(tab3)
+        self._create_log_tab()
+        self._refresh_add_btn()
 
-    # ------------------------------------------------------------------
-    # タブ1: 基本設定
-    # ------------------------------------------------------------------
+    def _create_settings_tab(self, slot: int) -> None:
+        """設定タブを1件作成してノートブックに追加する。"""
+        data = get_slot(self._settings_data, slot)
+        tab = SettingsTab(self._notebook, slot, data, self._on_save_slot)
+        self._slot_tabs.append(tab)
 
-    def _build_tab_settings(self, parent: ttk.Frame) -> None:
-        """基本設定タブのウィジェットを構築する。"""
-        pad = {"padx": 20, "pady": 6}
-        parent.columnconfigure(1, weight=1)
+        mark = " ✓" if data.get("enabled") else ""
+        label = f" 設定{slot}{mark} "
 
-        def row(r: int, label: str, widget_factory):
-            ttk.Label(parent, text=label, style="Field.TLabel").grid(
-                row=r, column=0, sticky=tk.W, **pad
-            )
-            w = widget_factory(parent)
-            w.grid(row=r, column=1, sticky=tk.EW, padx=(0, 20), pady=6)
-            return w
+        if self._log_tab_frame is not None:
+            # ログタブの直前に挿入
+            log_idx = self._notebook.index(self._log_tab_frame)
+            self._notebook.insert(log_idx, tab, text=label)
+        else:
+            self._notebook.add(tab, text=label)
 
-        # 対象URL
-        self._var_url = tk.StringVar(value=self._settings.get("url", "https://"))
-        row(0, "対象URL", lambda p: ttk.Entry(p, textvariable=self._var_url, style="Custom.TEntry"))
-
-        # PageDown間隔
-        self._var_interval = tk.DoubleVar(value=self._settings.get("scroll_interval", 3))
-        row(1, "PageDown間隔（秒）",
-            lambda p: ttk.Spinbox(p, from_=0.5, to=60, increment=0.5,
-                                  textvariable=self._var_interval,
-                                  style="Custom.TSpinbox", width=10))
-
-        # PageDown回数
-        self._var_count = tk.IntVar(value=self._settings.get("scroll_count", 5))
-        row(2, "PageDown回数",
-            lambda p: ttk.Spinbox(p, from_=1, to=100, increment=1,
-                                  textvariable=self._var_count,
-                                  style="Custom.TSpinbox", width=10))
-
-        # F5更新までの時間
-        self._var_refresh = tk.DoubleVar(value=self._settings.get("refresh_interval", 60))
-        row(3, "F5更新までの時間（秒）",
-            lambda p: ttk.Spinbox(p, from_=5, to=3600, increment=5,
-                                  textvariable=self._var_refresh,
-                                  style="Custom.TSpinbox", width=10))
-
-        # インスタンス数
-        self._var_instances = tk.IntVar(value=self._settings.get("instance_count", 1))
-        spin = ttk.Spinbox(
-            parent, from_=1, to=5, increment=1,
-            textvariable=self._var_instances,
-            style="Custom.TSpinbox", width=10,
-            command=self._refresh_account_forms,
-        )
-        ttk.Label(parent, text="起動インスタンス数（1〜5）", style="Field.TLabel").grid(
-            row=4, column=0, sticky=tk.W, **pad
-        )
-        spin.grid(row=4, column=1, sticky=tk.W, padx=(0, 20), pady=6)
-
-        # 保存ボタン
-        ttk.Button(
-            parent, text="設定を保存", style="Save.TButton",
-            command=self._save_settings,
-        ).grid(row=5, column=0, columnspan=2, pady=(16, 4))
-
-    def _save_settings(self) -> None:
-        """基本設定をsettings.jsonに保存する。"""
-        url = self._var_url.get().strip()
-        if not url.startswith("https://"):
-            messagebox.showwarning("入力エラー", "URLはhttps://から始める必要があります。")
-            return
-        settings = {
-            "url": url,
-            "scroll_interval": self._var_interval.get(),
-            "scroll_count": self._var_count.get(),
-            "refresh_interval": self._var_refresh.get(),
-            "instance_count": self._var_instances.get(),
-        }
-        save_settings(settings)
-        self._settings = settings
-        self._refresh_account_forms()
-        messagebox.showinfo("保存完了", "基本設定を保存しました。")
+    def _create_log_tab(self) -> None:
+        """ログタブを末尾に追加する。"""
+        self._log_tab_frame = ttk.Frame(self._notebook, style="Card.TFrame")
+        self._notebook.add(self._log_tab_frame, text=" ログ ")
+        self._build_log_area(self._log_tab_frame)
 
     # ------------------------------------------------------------------
-    # タブ2: アカウント設定
+    # ログエリア
     # ------------------------------------------------------------------
 
-    def _build_tab_accounts(self, parent: ttk.Frame) -> None:
-        """アカウント設定タブのスクロール可能なコンテナを構築する。"""
-        self._accounts_tab_parent = parent
-
-        # スクロール可能フレーム
-        canvas = tk.Canvas(parent, bg=C_CREAM, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self._accounts_inner = ttk.Frame(canvas, style="Card.TFrame")
-        self._accounts_inner_id = canvas.create_window(
-            (0, 0), window=self._accounts_inner, anchor=tk.NW
-        )
-
-        self._accounts_inner.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.itemconfig(self._accounts_inner_id, width=e.width),
-        )
-
-        # アカウントフォーム変数のリスト（最大5）
-        self._account_vars: list[tuple[tk.StringVar, tk.StringVar]] = [
-            (tk.StringVar(), tk.StringVar()) for _ in range(5)
-        ]
-
-        # 既存アカウントデータを変数にセット
-        for i, acc in enumerate(self._accounts):
-            if i < 5:
-                self._account_vars[i][0].set(acc.get("username", ""))
-                self._account_vars[i][1].set(acc.get("password", ""))
-
-        self._account_form_canvas = canvas
-
-    def _refresh_account_forms(self) -> None:
-        """インスタンス数に合わせてアカウントフォームを再描画する。"""
-        if not hasattr(self, "_accounts_inner"):
-            return
-
-        # 既存ウィジェットをクリア
-        for w in self._accounts_inner.winfo_children():
-            w.destroy()
-
-        count = self._var_instances.get()
-
-        for i in range(count):
-            color = INSTANCE_COLORS[i % len(INSTANCE_COLORS)]
-            frame = tk.LabelFrame(
-                self._accounts_inner,
-                text=f"  インスタンス {i + 1}  ",
-                bg=C_CREAM,
-                fg=color,
-                font=("Yu Gothic UI", 10, "bold"),
-                bd=1,
-                relief=tk.GROOVE,
-            )
-            frame.pack(fill=tk.X, padx=16, pady=(8, 4))
-            frame.columnconfigure(1, weight=1)
-
-            # ユーザー名
-            tk.Label(frame, text="ユーザー名", bg=C_CREAM, fg=C_TEXT_MID,
-                     font=("Yu Gothic UI", 10)).grid(
-                row=0, column=0, sticky=tk.W, padx=12, pady=6
-            )
-            ttk.Entry(frame, textvariable=self._account_vars[i][0],
-                      style="Custom.TEntry").grid(
-                row=0, column=1, sticky=tk.EW, padx=(0, 12), pady=6
-            )
-
-            # パスワード
-            tk.Label(frame, text="パスワード", bg=C_CREAM, fg=C_TEXT_MID,
-                     font=("Yu Gothic UI", 10)).grid(
-                row=1, column=0, sticky=tk.W, padx=12, pady=6
-            )
-            ttk.Entry(frame, textvariable=self._account_vars[i][1],
-                      style="Custom.TEntry").grid(
-                row=1, column=1, sticky=tk.EW, padx=(0, 12), pady=6
-            )
-
-        # 保存ボタン
-        ttk.Button(
-            self._accounts_inner,
-            text="アカウント情報を保存",
-            style="Save.TButton",
-            command=self._save_accounts,
-        ).pack(pady=14)
-
-    def _save_accounts(self) -> None:
-        """アカウント情報をFernet暗号化してaccounts.jsonに保存する。"""
-        count = self._var_instances.get()
-        accounts = []
-        for i in range(count):
-            username = self._account_vars[i][0].get().strip()
-            password = self._account_vars[i][1].get()
-            accounts.append({"username": username, "password": password})
-        save_accounts(accounts)
-        self._accounts = accounts
-        messagebox.showinfo("保存完了", "アカウント情報を暗号化して保存しました。")
-
-    # ------------------------------------------------------------------
-    # タブ3: ログ
-    # ------------------------------------------------------------------
-
-    def _build_tab_log(self, parent: ttk.Frame) -> None:
-        """ログタブのテキストエリアを構築する。"""
+    def _build_log_area(self, parent: ttk.Frame) -> None:
+        """ログタブの内側にテキストエリアを構築する。"""
         self._log_text = tk.Text(
             parent,
-            bg="#1C0A2A",
-            fg=C_PURPLE_PALE,
+            bg="#1C0A2A", fg=C_PURPLE_PALE,
             font=("Consolas", 9),
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            relief=tk.FLAT,
-            padx=8,
-            pady=6,
+            wrap=tk.WORD, state=tk.DISABLED,
+            relief=tk.FLAT, padx=8, pady=6,
         )
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self._log_text.yview)
-        self._log_text.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        sb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self._log_text.yview)
+        self._log_text.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._log_text.pack(fill=tk.BOTH, expand=True)
 
-        # インスタンスごとの色タグを登録
-        for i, color in enumerate(INSTANCE_COLORS, start=1):
-            self._log_text.tag_configure(f"inst{i}", foreground=color)
+        # スロットごとの色タグを登録
+        for i in range(1, MAX_SLOTS + 1):
+            color = LOG_COLORS[(i - 1) % len(LOG_COLORS)]
+            self._log_text.tag_configure(f"slot{i}", foreground=color)
         self._log_text.tag_configure("system", foreground=C_GOLD)
-        self._log_text.tag_configure("default", foreground=C_PURPLE_PALE)
 
     # ------------------------------------------------------------------
-    # フッター（開始・停止ボタン）
+    # フッター
     # ------------------------------------------------------------------
 
     def _build_footer(self) -> None:
-        """共通フッターの開始・停止ボタンを構築する。"""
+        """開始・停止ボタンを持つフッターを構築する。"""
         footer = tk.Frame(self, bg=C_PURPLE_PALE, height=56)
         footer.pack(fill=tk.X, side=tk.BOTTOM)
         footer.pack_propagate(False)
 
-        # 左右にグルーを置いてボタンを中央揃えにする
         inner = tk.Frame(footer, bg=C_PURPLE_PALE)
         inner.pack(expand=True)
 
@@ -450,50 +377,75 @@ class AutoScrollBotApp(tk.Tk):
 
         self._btn_stop = ttk.Button(
             inner, text="■  停止", style="Stop.TButton",
-            command=self._on_stop,
-            state=tk.DISABLED,
+            command=self._on_stop, state=tk.DISABLED,
         )
         self._btn_stop.pack(side=tk.LEFT, padx=10, pady=8)
 
     # ------------------------------------------------------------------
-    # 開始・停止ハンドラ
+    # イベントハンドラ
     # ------------------------------------------------------------------
 
+    def _on_add_tab(self) -> None:
+        """タブ追加ボタン: 次のスロット番号の設定タブを追加する。"""
+        if len(self._slot_tabs) >= MAX_SLOTS:
+            return
+
+        slot = len(self._slot_tabs) + 1
+        self._create_settings_tab(slot)
+
+        # slot_count を更新して保存
+        self._settings_data["slot_count"] = len(self._slot_tabs)
+        save_settings(self._settings_data)
+
+        # 新しいタブにフォーカス
+        self._notebook.select(self._slot_tabs[-1])
+        self._refresh_add_btn()
+
+    def _on_save_slot(self, slot: int, config: dict) -> None:
+        """設定タブの「設定を保存」ボタン: 当該スロットを保存する。"""
+        save_slot(slot, config)
+        messagebox.showinfo("保存完了", f"設定{slot} を保存しました。")
+
     def _on_start(self) -> None:
-        """開始ボタン押下時の処理。バリデーションを行い全インスタンスを起動する。"""
-        url = self._var_url.get().strip()
-        if not url.startswith("https://"):
-            messagebox.showwarning("入力エラー", "URLはhttps://から始める必要があります。")
+        """開始ボタン: 有効スロットを収集してBotManagerを起動する。"""
+        enabled = []
+        for tab in self._slot_tabs:
+            cfg = tab.get_config()
+            if not cfg["enabled"]:
+                continue
+            if not cfg["url"].startswith("https://"):
+                messagebox.showwarning(
+                    "入力エラー",
+                    f"設定{tab.slot}: URLは https:// から始める必要があります。"
+                )
+                return
+            enabled.append({"slot": tab.slot, **cfg})
+
+        if not enabled:
+            messagebox.showwarning(
+                "設定エラー",
+                "有効なスロットが1つもありません。\n"
+                "いずれかの設定タブでチェックボックスをONにしてください。"
+            )
             return
 
         self._btn_start.config(state=tk.DISABLED)
         self._btn_stop.config(state=tk.NORMAL)
+        self._notebook.select(self._log_tab_frame)
 
-        # ログタブに切り替え
-        self._notebook.select(2)
-
-        self._manager.start(
-            instance_count=self._var_instances.get(),
-            target_url=url,
-            scroll_interval=self._var_interval.get(),
-            scroll_count=self._var_count.get(),
-            refresh_interval=self._var_refresh.get(),
-        )
-
-        # ボットが全停止したら開始ボタンを復活させる監視スレッド
+        self._manager.start(enabled, self._enqueue_log)
         threading.Thread(target=self._watch_bots, daemon=True).start()
 
     def _on_stop(self) -> None:
-        """停止ボタン押下時の処理。全インスタンスに停止シグナルを送る。"""
+        """停止ボタン: 全ボットに停止シグナルを送る。"""
         self._manager.stop()
         self._btn_stop.config(state=tk.DISABLED)
 
     def _watch_bots(self) -> None:
-        """全ボットスレッドの終了を監視し、終了後に開始ボタンを有効化する。"""
+        """全スレッド終了を監視して開始ボタンを復活させる。"""
         import time
         while self._manager.is_running():
             time.sleep(1)
-        # GUIスレッドに戻して状態更新
         self.after(0, lambda: self._btn_start.config(state=tk.NORMAL))
         self.after(0, lambda: self._btn_stop.config(state=tk.DISABLED))
 
@@ -502,20 +454,16 @@ class AutoScrollBotApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _enqueue_log(self, message: str) -> None:
-        """
-        スレッドから安全にログをキューに追加する。
-        メッセージからインスタンス番号を解析して色タグを決定する。
-        """
-        # インスタンス番号を解析
+        """スレッドから安全にログをキューに追加する。"""
         tag = "system"
-        for i in range(1, 6):
-            if f"インスタンス{i}" in message:
-                tag = f"inst{i}"
+        for i in range(1, MAX_SLOTS + 1):
+            if f"スロット{i}:" in message:
+                tag = f"slot{i}"
                 break
         self._log_queue.put((message, tag))
 
     def _poll_log_queue(self) -> None:
-        """メインスレッドでキューを定期的に確認してログを描画する。"""
+        """100msごとにキューを確認してログを描画する。"""
         try:
             while True:
                 message, tag = self._log_queue.get_nowait()
@@ -524,18 +472,16 @@ class AutoScrollBotApp(tk.Tk):
             pass
         self.after(100, self._poll_log_queue)
 
-    def _append_log(self, message: str, tag: str = "default") -> None:
-        """ログテキストエリアにメッセージを追記する。"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}\n"
-
+    def _append_log(self, message: str, tag: str = "system") -> None:
+        """ログテキストエリアにタイムスタンプ付きでメッセージを追記する。"""
+        ts = datetime.now().strftime("%H:%M:%S")
         self._log_text.config(state=tk.NORMAL)
-        self._log_text.insert(tk.END, line, tag)
+        self._log_text.insert(tk.END, f"[{ts}] {message}\n", tag)
         self._log_text.see(tk.END)
         self._log_text.config(state=tk.DISABLED)
 
 
-# ---- エントリポイント ----------------------------------------------------------
+# ---- エントリポイント -----------------------------------------------------------
 
 if __name__ == "__main__":
     app = AutoScrollBotApp()

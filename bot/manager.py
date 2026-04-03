@@ -1,5 +1,5 @@
 """
-複数BrowserBotインスタンスをスレッドで並列管理するマネージャー。
+有効なスロット設定を受け取り、BrowserBot を並列スレッドで管理するマネージャー。
 """
 
 import threading
@@ -9,63 +9,44 @@ from bot.browser_bot import BrowserBot
 
 
 class BotManager:
-    """
-    最大5つのBrowserBotを並列起動・停止するマネージャー。
-    """
+    """最大10スロットのBrowserBotを並列起動・停止する。"""
 
-    def __init__(self, log_callback: Callable[[str], None]):
-        """
-        Args:
-            log_callback: ログ出力コールバック関数。BrowserBotに渡される。
-        """
-        self.log_callback = log_callback
+    def __init__(self) -> None:
         self._bots: list[BrowserBot] = []
         self._threads: list[threading.Thread] = []
 
-    def start(
-        self,
-        instance_count: int,
-        target_url: str,
-        scroll_interval: float,
-        scroll_count: int,
-        refresh_interval: float,
-    ) -> None:
+    def start(self, slot_configs: list[dict], log_callback: Callable[[str], None]) -> None:
         """
-        指定インスタンス数分のBrowserBotをスレッドで起動する。
-        ログインは各ブラウザで手動で行う。
+        有効スロット分のBrowserBotをスレッドで起動する。
 
         Args:
-            instance_count: 起動するインスタンス数（1〜5）
-            target_url: スクロール対象URL
-            scroll_interval: PageDown間隔（秒）
-            scroll_count: PageDown回数
-            refresh_interval: F5更新までの時間（秒）
+            slot_configs: 有効スロットの設定リスト。各要素は以下のキーを持つ。
+                          {"slot", "url", "scroll_interval", "scroll_count", "refresh_interval"}
+            log_callback: ログ出力コールバック
         """
         self._bots.clear()
         self._threads.clear()
 
-        for i in range(1, instance_count + 1):
+        for cfg in slot_configs:
             bot = BrowserBot(
-                index=i,
-                target_url=target_url,
-                scroll_interval=scroll_interval,
-                scroll_count=scroll_count,
-                refresh_interval=refresh_interval,
-                log_callback=self.log_callback,
+                slot=cfg["slot"],
+                url=cfg["url"],
+                scroll_interval=cfg["scroll_interval"],
+                scroll_count=cfg["scroll_count"],
+                refresh_interval=cfg["refresh_interval"],
+                log_callback=log_callback,
             )
             self._bots.append(bot)
+            t = threading.Thread(target=bot.run, daemon=True, name=f"bot-slot{cfg['slot']}")
+            self._threads.append(t)
+            t.start()
 
-            thread = threading.Thread(target=bot.run, daemon=True, name=f"bot-{i}")
-            self._threads.append(thread)
-            thread.start()
-
-        self.log_callback(f"▶ {instance_count}件のインスタンスを起動しました")
+        log_callback(f"▶ {len(slot_configs)} 件のインスタンスを起動しました")
 
     def stop(self) -> None:
-        """全BrowserBotに停止シグナルを送る。"""
+        """全ボットに停止シグナルを送る。"""
         for bot in self._bots:
             bot.stop()
-        self.log_callback("■ 全インスタンスに停止シグナルを送信しました")
 
     def is_running(self) -> bool:
         """いずれかのスレッドが実行中かどうかを返す。"""

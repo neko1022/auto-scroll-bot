@@ -1,7 +1,7 @@
 """
-単一Chromeインスタンスのログイン待機・スクロール・F5更新を担うクラス。
-undetected-chromedriver を使用してbot検知を回避する。
-ログインは手動で行い、完了を検知してからスクロールを開始する。
+1スロット分の Chrome 起動・手動ログイン待機・スクロールループを担うクラス。
+undetected-chromedriver でbot検知を回避する。
+プロファイルは profiles/slot{n}/ に保存してセッションを再利用する。
 """
 
 import os
@@ -13,17 +13,17 @@ from typing import Callable
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys  # PageDown用
+from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import WebDriverException
 
 # プロファイル保存先
-_BASE_DIR = os.path.normpath(
+_BASE = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 )
-PROFILES_DIR = os.path.join(_BASE_DIR, "profiles")
+PROFILES_DIR = os.path.join(_BASE, "profiles")
 
-# 手動ログイン待機の最大秒数
-MANUAL_AUTH_TIMEOUT = 300  # 5分
+# 手動ログイン待機の最大秒数（5分）
+MANUAL_LOGIN_TIMEOUT = 300
 
 # 通常のChromeと同じUser-Agent
 USER_AGENT = (
@@ -32,15 +32,14 @@ USER_AGENT = (
     "Chrome/136.0.0.0 Safari/537.36"
 )
 
-
-# 複数スレッドが同時にChromeを初期化するとucが競合するため直列化する
+# 複数スレッドの同時初期化競合を防ぐロック
 _driver_init_lock = threading.Lock()
 
 
-def _get_chrome_major_version() -> int | None:
+def _get_chrome_version() -> int | None:
     """
-    インストール済みChromeのメジャーバージョン番号を返す。
-    Windowsレジストリから取得し、失敗した場合はNoneを返す。
+    Windowsレジストリからインストール済みChromeのメジャーバージョンを返す。
+    取得できない場合は None を返す。
     """
     reg_paths = [
         r"HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon",
@@ -49,13 +48,13 @@ def _get_chrome_major_version() -> int | None:
     ]
     for path in reg_paths:
         try:
-            result = subprocess.run(
+            r = subprocess.run(
                 ["reg", "query", path, "/v", "version"],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5,
             )
-            match = re.search(r"(\d+)\.\d+\.\d+\.\d+", result.stdout)
-            if match:
-                return int(match.group(1))
+            m = re.search(r"(\d+)\.\d+\.\d+\.\d+", r.stdout)
+            if m:
+                return int(m.group(1))
         except Exception:
             continue
     return None
@@ -63,14 +62,14 @@ def _get_chrome_major_version() -> int | None:
 
 class BrowserBot:
     """
-    1つのChromeウィンドウを制御するボット。
-    手動ログイン完了を検知してからスクロールループを実行する。
+    1スロット分の自動操作ボット。
+    ログイン待機・スクロール・F5更新を独立したスレッドで実行する。
     """
 
     def __init__(
         self,
-        index: int,
-        target_url: str,
+        slot: int,
+        url: str,
         scroll_interval: float,
         scroll_count: int,
         refresh_interval: float,
@@ -78,40 +77,40 @@ class BrowserBot:
     ):
         """
         Args:
-            index: インスタンス番号（1始まり）
-            target_url: スクロール対象URL
+            slot: スロット番号（1〜10）
+            url: スクロール対象URL
             scroll_interval: PageDown間隔（秒）
             scroll_count: PageDown回数
-            refresh_interval: F5更新までの時間（秒）
-            log_callback: ログ出力コールバック関数
+            refresh_interval: F5更新までの待機時間（秒）
+            log_callback: ログ出力コールバック
         """
-        self.index = index
-        self.target_url = target_url
+        self.slot = slot
+        self.url = url
         self.scroll_interval = scroll_interval
         self.scroll_count = scroll_count
         self.refresh_interval = refresh_interval
-        self.log = log_callback
+        self._log_cb = log_callback
         self.driver: uc.Chrome | None = None
         self._stop_event = threading.Event()
 
     # ------------------------------------------------------------------
-    # 内部ユーティリティ
+    # ユーティリティ
     # ------------------------------------------------------------------
 
     def _log(self, message: str) -> None:
-        """インスタンス番号付きでログを出力する。"""
-        self.log(f"インスタンス{self.index}: {message}")
+        """スロット番号付きでログを出力する。"""
+        self._log_cb(f"スロット{self.slot}: {message}")
 
     def _is_stopped(self) -> bool:
-        """停止フラグが立っているか確認する。"""
+        """停止フラグが立っているか返す。"""
         return self._stop_event.is_set()
 
     def _sleep(self, seconds: float) -> bool:
         """
-        指定秒数スリープする。停止フラグが立ったら即座に抜ける。
+        指定秒スリープする。停止フラグで即座に抜ける。
 
         Returns:
-            True: 正常にスリープ完了 / False: 停止フラグで中断
+            True: 完了 / False: 停止フラグで中断
         """
         end = time.time() + seconds
         while time.time() < end:
@@ -126,11 +125,10 @@ class BrowserBot:
 
     def _build_driver(self) -> uc.Chrome:
         """
-        undetected-chromedriver を使用してChromeを起動する。
-        複数インスタンスの同時初期化による競合を防ぐためロックで直列化する。
-        専用プロファイル・User-Agent・bot検知回避オプションを設定する。
+        専用プロファイル付きのChromeを起動して返す。
+        ロックで直列化し複数スロットの同時初期化競合を防ぐ。
         """
-        profile_dir = os.path.join(PROFILES_DIR, f"account{self.index}")
+        profile_dir = os.path.join(PROFILES_DIR, f"slot{self.slot}")
         os.makedirs(profile_dir, exist_ok=True)
 
         options = uc.ChromeOptions()
@@ -139,54 +137,52 @@ class BrowserBot:
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-popup-blocking")
 
-        chrome_version = _get_chrome_major_version()
-        if chrome_version:
-            self._log(f"Chrome バージョン検出: {chrome_version}")
+        ver = _get_chrome_version()
+        if ver:
+            self._log(f"Chrome {ver} を検出")
         else:
-            self._log("Chrome バージョンの自動検出に失敗しました。ucの自動検出を使用します。")
+            self._log("Chromeバージョン自動検出に失敗しました")
 
-        # ロックを取得してから初期化（同時起動による競合を防ぐ）
         with _driver_init_lock:
             driver = uc.Chrome(
                 options=options,
                 user_data_dir=profile_dir,
-                version_main=chrome_version,
+                version_main=ver,
             )
         return driver
 
     # ------------------------------------------------------------------
-    # ログイン状態の確認
+    # ログイン状態確認
     # ------------------------------------------------------------------
 
-    def _is_on_home(self) -> bool:
+    def _is_logged_in(self) -> bool:
         """
-        現在のページがログイン済みホーム画面かを確認する。
-        URLと認証済みナビバーDOMの両方で判定する。
+        現在のページがログイン済みかをURLとDOMで判定する。
+        ログインページにいる場合・ナビバーDOMが存在しない場合は False を返す。
         """
         try:
             url = self.driver.current_url
             if any(p in url for p in ("login", "i/flow", "signin")):
                 return False
-            elements = self.driver.find_elements(
+            elems = self.driver.find_elements(
                 By.CSS_SELECTOR, '[data-testid="AppTabBar_Home_Link"]'
             )
-            return len(elements) > 0
+            return len(elems) > 0
         except WebDriverException:
             return False
 
-    def _wait_for_manual_login(self) -> bool:
+    def _wait_for_login(self) -> bool:
         """
-        ユーザーが手動でログインするのを待機する（最大5分）。
-        ホーム画面への遷移を検知したらTrueを返す。
+        手動ログインが完了するまでポーリングで待機する（最大5分）。
 
         Returns:
             True: ログイン完了 / False: タイムアウトまたは停止
         """
-        deadline = time.time() + MANUAL_AUTH_TIMEOUT
+        deadline = time.time() + MANUAL_LOGIN_TIMEOUT
         while time.time() < deadline:
             if self._is_stopped():
                 return False
-            if self._is_on_home():
+            if self._is_logged_in():
                 self._log("✅ ログイン完了を確認しました")
                 return True
             time.sleep(3)
@@ -197,43 +193,28 @@ class BrowserBot:
     # スクロールループ
     # ------------------------------------------------------------------
 
-    def _press_page_down(self) -> None:
-        """body要素を毎回取得してPageDownを1回押す。"""
-        try:
-            self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
-        except WebDriverException:
-            pass
-
-    def _press_f5(self) -> None:
-        """
-        driver.refresh() でページを更新し、トップにスクロールして読み込みを待機する。
-        Keys.F5 はフォーカス依存のため使用しない。
-        """
-        try:
-            self.driver.refresh()
-            time.sleep(3)  # ページ読み込み待機
-            self.driver.execute_script("window.scrollTo(0, 0)")
-        except WebDriverException:
-            pass
-
     def _scroll_loop(self) -> None:
         """
         以下を停止ボタンが押されるまで無限に繰り返す。
 
         ループ:
-          1. PageDownを scroll_interval 秒ごとに scroll_count 回押す
-          2. refresh_interval 秒待ってから F5 を押す
-          3. 1 に戻る
+          1. PageDown を scroll_interval 秒ごとに scroll_count 回押す
+          2. refresh_interval 秒待つ
+          3. ページを更新してトップへ戻る
+          4. 1 に戻る
         """
         self._log("スクロール動作を開始します")
 
         while not self._is_stopped():
 
-            # Step 1: PageDownを scroll_interval 秒ごとに scroll_count 回押す
+            # Step 1: PageDown × scroll_count 回（間隔: scroll_interval 秒）
             for _ in range(self.scroll_count):
                 if self._is_stopped():
                     return
-                self._press_page_down()
+                try:
+                    self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.PAGE_DOWN)
+                except WebDriverException:
+                    pass
                 if not self._sleep(self.scroll_interval):
                     return
 
@@ -241,11 +222,16 @@ class BrowserBot:
             if not self._sleep(self.refresh_interval):
                 return
 
-            # Step 3: F5更新
+            # Step 3: ページ更新 → トップへ戻る
             if self._is_stopped():
                 return
-            self._log("🔄 F5更新")
-            self._press_f5()
+            try:
+                self._log("🔄 更新")
+                self.driver.refresh()
+                time.sleep(3)
+                self.driver.execute_script("window.scrollTo(0, 0)")
+            except WebDriverException:
+                pass
 
             # → Step 1 に戻る
 
@@ -255,51 +241,44 @@ class BrowserBot:
 
     def run(self) -> None:
         """
-        ボットのメイン処理。以下の順で実行する。
-
-        1. Chrome起動
-        2. https://x.com/login に遷移
-        3. 既存セッションがあれば /home を確認してスキップ
-        4. 未ログインの場合は手動ログインを待機（最大5分）
-        5. 対象URLへ遷移してスクロール動作を開始
+        ボットのメイン処理。
+        1. Chrome起動（専用プロファイル）
+        2. x.com/login に遷移
+        3. セッション継続またはログイン完了を確認
+        4. 対象URLへ遷移
+        5. スクロールループ（無限）
         """
         self._stop_event.clear()
         try:
-            self._log("Chromeを起動しています...")
+            self._log("Chrome 起動中...")
             self.driver = self._build_driver()
 
-            # ログインページへ遷移
             self._log("https://x.com/login に遷移します...")
             self.driver.get("https://x.com/login")
             time.sleep(3)
 
-            # 既存セッション確認
-            if self._is_on_home():
+            if self._is_logged_in():
                 self._log("✅ 既存セッションでログイン済み")
             else:
-                # 手動ログイン待機
                 self._log("⚠️ 手動でログインしてください。完了を自動検知します...")
-                ok = self._wait_for_manual_login()
-                if not ok:
+                if not self._wait_for_login():
                     return
 
-            # 対象URLへ遷移
-            self._log(f"対象URLへ遷移します: {self.target_url}")
-            self.driver.get(self.target_url)
+            self._log(f"対象URLへ遷移: {self.url}")
+            self.driver.get(self.url)
             time.sleep(3)
 
-            # スクロールループ開始
             self._scroll_loop()
 
         except WebDriverException as e:
             self._log(f"❌ ブラウザエラー: {e}")
         except Exception as e:
-            self._log(f"❌ 予期しないエラー: {e}")
+            self._log(f"❌ エラー: {e}")
         finally:
             self._quit()
 
     def stop(self) -> None:
-        """ボットを停止する。スクロールループを抜けてChromeを閉じる。"""
+        """停止フラグを立てる。"""
         self._stop_event.set()
 
     def _quit(self) -> None:
