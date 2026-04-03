@@ -5,6 +5,8 @@ undetected-chromedriver を使用してbot検知を回避する。
 """
 
 import os
+import re
+import subprocess
 import time
 import random
 import threading
@@ -20,6 +22,30 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
+
+def _get_chrome_major_version() -> int | None:
+    """
+    インストール済みChromeのメジャーバージョン番号を返す。
+    Windowsレジストリから取得し、失敗した場合はNoneを返す。
+    """
+    reg_paths = [
+        r"HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon",
+        r"HKEY_LOCAL_MACHINE\SOFTWARE\Google\Chrome\BLBeacon",
+        r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon",
+    ]
+    for path in reg_paths:
+        try:
+            result = subprocess.run(
+                ["reg", "query", path, "/v", "version"],
+                capture_output=True, text=True, timeout=5
+            )
+            match = re.search(r"(\d+)\.\d+\.\d+\.\d+", result.stdout)
+            if match:
+                return int(match.group(1))
+        except Exception:
+            continue
+    return None
+
 
 # プロファイル保存先
 _BASE_DIR = os.path.normpath(
@@ -179,11 +205,18 @@ class BrowserBot:
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-popup-blocking")
 
-        # undetected-chromedriver に user_data_dir をキーワード引数で渡す
-        # （optionsのargumentで渡すよりucの内部処理との競合が起きにくい）
+        # インストール済みChromeのバージョンを取得して明示的に指定する
+        # （ucのバージョン自動検出がズレる場合の対策）
+        chrome_version = _get_chrome_major_version()
+        if chrome_version:
+            self._log(f"Chrome バージョン検出: {chrome_version}")
+        else:
+            self._log("Chrome バージョンの自動検出に失敗しました。ucの自動検出を使用します。")
+
         driver = uc.Chrome(
             options=options,
             user_data_dir=profile_dir,
+            version_main=chrome_version,  # None の場合は uc が自動検出を試みる
         )
         return driver
 
