@@ -1,0 +1,20 @@
+# 機密情報
+accounts.json
+key.bin
+
+# ユーザーデータ
+profiles/
+settings.json
+
+# PyInstaller
+*.spec
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
