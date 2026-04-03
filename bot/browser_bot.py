@@ -15,7 +15,9 @@ from typing import Callable
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import WebDriverException, TimeoutException
 
 # exe実行時はexeと同じフォルダ、python実行時はプロジェクトルート
 if getattr(sys, "frozen", False):
@@ -152,7 +154,60 @@ class BrowserBot:
                 user_data_dir=profile_dir,
                 version_main=ver,
             )
+
+        # 要素検索のデフォルト待機時間を設定
+        driver.implicitly_wait(10)
         return driver
+
+    # ------------------------------------------------------------------
+    # URL遷移（リトライ付き）
+    # ------------------------------------------------------------------
+
+    def _navigate_to(self, url: str, wait_selector: str | None = None) -> bool:
+        """
+        指定URLへ遷移し、ページロード完了を確認する。
+        失敗した場合は最大3回リトライする。
+
+        Args:
+            url: 遷移先URL
+            wait_selector: ロード完了の目印となるCSSセレクタ（省略可）
+
+        Returns:
+            True: 遷移成功 / False: 3回失敗またはstop
+        """
+        max_retry = 3
+        for attempt in range(1, max_retry + 1):
+            if self._is_stopped():
+                return False
+            try:
+                self._log(f"🌐 URLに遷移中... {url}"
+                          + (f"（{attempt}回目）" if attempt > 1 else ""))
+                self.driver.get(url)
+
+                if wait_selector:
+                    # 指定セレクタが現れるまで最大20秒待機
+                    WebDriverWait(self.driver, 20).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, wait_selector))
+                    )
+                else:
+                    # document.readyState が complete になるまで待機
+                    WebDriverWait(self.driver, 20).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+
+                self._log("✅ 遷移完了")
+                return True
+
+            except TimeoutException:
+                self._log(f"⚠️ ページロードタイムアウト（{attempt}/{max_retry}）")
+            except WebDriverException as e:
+                self._log(f"⚠️ 遷移エラー（{attempt}/{max_retry}）: {e}")
+
+            if attempt < max_retry:
+                time.sleep(3)
+
+        self._log(f"❌ {max_retry}回リトライしましたが遷移に失敗しました")
+        return False
 
     # ------------------------------------------------------------------
     # ログイン状態確認
@@ -231,9 +286,12 @@ class BrowserBot:
             try:
                 self._log("🔄 更新")
                 self.driver.refresh()
-                time.sleep(3)
+                # ページロード完了を待ってからトップへ戻る
+                WebDriverWait(self.driver, 20).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
                 self.driver.execute_script("window.scrollTo(0, 0)")
-            except WebDriverException:
+            except (WebDriverException, TimeoutException):
                 pass
 
             # → Step 1 に戻る
@@ -256,9 +314,13 @@ class BrowserBot:
             self._log("Chrome 起動中...")
             self.driver = self._build_driver()
 
-            self._log("https://x.com/login に遷移します...")
-            self.driver.get("https://x.com/login")
-            time.sleep(3)
+            # x.com/login へ遷移（入力欄を待ち受けてロード完了を確認）
+            ok = self._navigate_to(
+                "https://x.com/login",
+                wait_selector='input, [data-testid="AppTabBar_Home_Link"]',
+            )
+            if not ok:
+                return
 
             if self._is_logged_in():
                 self._log("✅ 既存セッションでログイン済み")
@@ -267,9 +329,10 @@ class BrowserBot:
                 if not self._wait_for_login():
                     return
 
-            self._log(f"対象URLへ遷移: {self.url}")
-            self.driver.get(self.url)
-            time.sleep(3)
+            # 対象URLへ遷移（bodyが現れたらロード完了とみなす）
+            ok = self._navigate_to(self.url, wait_selector="body")
+            if not ok:
+                return
 
             self._scroll_loop()
 
