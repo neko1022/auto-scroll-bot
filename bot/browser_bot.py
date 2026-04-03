@@ -78,6 +78,7 @@ class BrowserBot:
         scroll_interval: float,
         scroll_count: int,
         refresh_interval: float,
+        start_delay: float,
         log_callback: Callable[[str], None],
     ):
         """
@@ -87,6 +88,7 @@ class BrowserBot:
             scroll_interval: PageDown間隔（秒）
             scroll_count: PageDown回数
             refresh_interval: F5更新までの待機時間（秒）
+            start_delay: Chrome起動前の待機秒数（時間差起動用）
             log_callback: ログ出力コールバック
         """
         self.slot = slot
@@ -94,6 +96,7 @@ class BrowserBot:
         self.scroll_interval = scroll_interval
         self.scroll_count = scroll_count
         self.refresh_interval = refresh_interval
+        self._start_delay = start_delay
         self._log_cb = log_callback
         self.driver: uc.Chrome | None = None
         self._stop_event = threading.Event()
@@ -128,36 +131,49 @@ class BrowserBot:
     # Chrome起動
     # ------------------------------------------------------------------
 
-    def _build_driver(self) -> uc.Chrome:
+    def _build_driver(self) -> uc.Chrome | None:
         """
         専用プロファイル付きのChromeを起動して返す。
-        ロックで直列化し複数スロットの同時初期化競合を防ぐ。
+        起動失敗時は5秒おきに最大3回リトライする。
+        成功したら implicitly_wait と page_load_timeout を設定して返す。
+        3回とも失敗した場合は None を返す。
         """
         profile_dir = os.path.join(PROFILES_DIR, f"slot{self.slot}")
         os.makedirs(profile_dir, exist_ok=True)
 
-        options = uc.ChromeOptions()
-        options.add_argument(f"--user-agent={USER_AGENT}")
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--disable-popup-blocking")
-
         ver = _get_chrome_version()
         if ver:
             self._log(f"Chrome {ver} を検出")
-        else:
-            self._log("Chromeバージョン自動検出に失敗しました")
 
-        with _driver_init_lock:
-            driver = uc.Chrome(
-                options=options,
-                user_data_dir=profile_dir,
-                version_main=ver,
-            )
+        max_retry = 3
+        for attempt in range(1, max_retry + 1):
+            if self._is_stopped():
+                return None
+            try:
+                options = uc.ChromeOptions()
+                options.add_argument(f"--user-agent={USER_AGENT}")
+                options.add_argument("--no-first-run")
+                options.add_argument("--no-default-browser-check")
+                options.add_argument("--disable-popup-blocking")
 
-        # 要素検索のデフォルト待機時間を設定
-        driver.implicitly_wait(10)
-        return driver
+                with _driver_init_lock:
+                    driver = uc.Chrome(
+                        options=options,
+                        user_data_dir=profile_dir,
+                        version_main=ver,
+                    )
+
+                driver.implicitly_wait(20)
+                driver.set_page_load_timeout(60)
+                self._log("✅ 起動完了")
+                return driver
+
+            except Exception as e:
+                self._log(f"❌ 起動失敗 リトライ{attempt}/{max_retry}: {e}")
+                if attempt < max_retry:
+                    time.sleep(5)
+
+        return None
 
     # ------------------------------------------------------------------
     # URL遷移（リトライ付き）
@@ -311,8 +327,19 @@ class BrowserBot:
         """
         self._stop_event.clear()
         try:
-            self._log("Chrome 起動中...")
+            # 時間差起動：指定秒数待機してから Chrome を起動する
+            if self._start_delay > 0:
+                wait_sec = round(self._start_delay)
+                self._log(f"🌐 Chrome起動中...（{wait_sec}秒待機）")
+                if not self._sleep(self._start_delay):
+                    return
+            else:
+                self._log("🌐 Chrome起動中...")
+
             self.driver = self._build_driver()
+            if self.driver is None:
+                self._log("❌ Chrome起動に3回失敗しました。スロットを停止します。")
+                return
 
             # x.com/login へ遷移（入力欄を待ち受けてロード完了を確認）
             ok = self._navigate_to(
